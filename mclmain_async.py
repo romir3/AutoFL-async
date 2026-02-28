@@ -211,15 +211,25 @@ def get_data_loaders(
     client_datasets = random_split(train_dataset, client_sizes)
     
     batch_size = cfg.client.batch_size
-    train_loaders = [
-        DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=0)
-        for ds in client_datasets
-    ]
+   
+    train_loaders = []
     
-    # Each client gets full test set for simplicity
-    test_loader = DataLoader(
-        test_dataset, batch_size=batch_size, shuffle=False, num_workers=0
-    )
+    # NEW: Create 10 partitions per client instead of 1
+    for client_idx, client_dataset in enumerate(client_datasets):
+        client_size = len(client_dataset)
+        partition_size = client_size // 10
+        partition_sizes = [partition_size] * 10
+        partition_sizes[-1] += client_size - sum(partition_sizes)
+        
+        client_partitions = random_split(client_dataset, partition_sizes)
+        client_partition_loaders = [
+            DataLoader(partition, batch_size=batch_size, shuffle=True, num_workers=0)
+            for partition in client_partitions
+        ]
+        train_loaders.append(client_partition_loaders)  # 2D structure
+    
+    # Test loaders remain unchanged
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
     test_loaders = [test_loader] * num_clients
     
     return train_loaders, test_loaders, test_loader
@@ -229,7 +239,7 @@ def run_async_simulation(
     cfg: DictConfig,
     async_cfg: Dict[str, Any],
     model_fn: callable,
-    train_loaders: List[DataLoader],
+    train_loaders: List[List[DataLoader]],
     test_loaders: List[DataLoader],
     global_test_loader: DataLoader,
     device: torch.device,
@@ -329,8 +339,14 @@ def run_async_simulation(
         client = clients[client_idx]
         with param_lock:
             params = current_params
+
+             partition_idx = round_counter % 10
+             #Calculate partition to use based on round number
         
-        config = {"start_timestamp": time()}
+        config = {
+            "start_timestamp": time(),
+          "partition_idx": partition_idx
+          }
         fit_ins = FitIns(parameters=params, config=config)
         fit_res = client.fit(fit_ins)
         

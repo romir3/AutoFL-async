@@ -36,7 +36,7 @@ class SimulatedClientConfig:
     """Configuration for simulated async client."""
     client_id: str
     model_fn: callable  # Function to create model
-    train_loader: DataLoader
+    train_loaders: List[DataLoader] # now 2d array for cl
     test_loader: DataLoader
     device: torch.device
     local_epochs: int = 2
@@ -57,12 +57,13 @@ class SimulatedAsyncClient(ClientProxy):
         super().__init__(config.client_id)
         self.config = config
         self.model = config.model_fn().to(config.device)
-        self.train_loader = config.train_loader
+        self.train_loaders = config.train_loaders
         self.test_loader = config.test_loader
         self.device = config.device
         self.local_epochs = config.local_epochs
         self.learning_rate = config.learning_rate
-        self._num_examples = len(config.train_loader.dataset)
+        #changed so that handles for trainloader array
+        self._num_examples = sum(len(loader.dataset) for loader in config.train_loaders)
         
     def get_parameters(
         self, ins: GetParametersIns, timeout: Optional[float] = None
@@ -90,6 +91,11 @@ class SimulatedAsyncClient(ClientProxy):
     ) -> FitRes:
         """Train the model on local data."""
         start_time = time.time()
+
+         #Extract partition_idx from config
+        partition_idx = ins.config.get("partition_idx", 0)
+        partition_idx = partition_idx % len(self.train_loaders)
+        train_loader = self.train_loaders[partition_idx]
         
         # Simulate network delay (download)
         if self.config.simulate_delay:
@@ -114,8 +120,10 @@ class SimulatedAsyncClient(ClientProxy):
         
         total_loss = 0.0
         num_batches = 0
+        num_samples_trained = 0  # Track actual samples in this partition
+
         for epoch in range(self.local_epochs):
-            for batch in self.train_loader:
+            for batch in train_loader:
                 if isinstance(batch, dict):
                     images = batch.get("img", batch.get("x")).to(self.device)
                     labels = batch.get("label", batch.get("y")).to(self.device)
@@ -132,6 +140,7 @@ class SimulatedAsyncClient(ClientProxy):
                 
                 total_loss += loss.item()
                 num_batches += 1
+                num_samples_trained += labels.size(0)
         
         avg_loss = total_loss / max(num_batches, 1)
         
@@ -150,11 +159,12 @@ class SimulatedAsyncClient(ClientProxy):
         return FitRes(
             status=Status(code=Code.OK, message="Success"),
             parameters=ndarrays_to_parameters(new_params),
-            num_examples=self._num_examples,
+            num_examples=num_samples_trained,
             metrics={
                 "loss": avg_loss,
                 "training_time": elapsed,
                 "start_timestamp": ins.config.get("start_timestamp", start_time),
+                 "partition_idx": partition_idx, #Track which partition was used
                 "client_id": self.cid,
             },
         )
@@ -215,7 +225,7 @@ class SimulatedAsyncClient(ClientProxy):
 def create_simulated_clients(
     num_clients: int,
     model_fn: callable,
-    train_loaders: List[DataLoader],
+    train_loaders: List[List[DataLoader]], #2d strucutre
     test_loaders: List[DataLoader],
     device: torch.device,
     local_epochs: int = 2,
@@ -246,7 +256,7 @@ def create_simulated_clients(
         config = SimulatedClientConfig(
             client_id=str(i),
             model_fn=model_fn,
-            train_loader=train_loaders[i % len(train_loaders)],
+            train_loaders=train_loaders[i],
             test_loader=test_loaders[i % len(test_loaders)],
             device=device,
             local_epochs=local_epochs,
