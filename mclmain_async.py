@@ -279,7 +279,16 @@ def run_async_simulation(
     global_params = [val.cpu().numpy() for _, val in global_model.state_dict().items()]
     
     # Create async strategy
-    total_samples = sum(len(loader.dataset) for loader in train_loaders)
+    total_samples = sum(
+        len(loader.dataset) 
+        for client_loaders in train_loaders 
+        for loader in client_loaders
+    )
+
+    samples_per_partition = total_samples // (len(train_loaders) * len(train_loaders[0])) if train_loaders else 0
+    print(f"Total training samples: {total_samples}")
+    print(f"Samples per client partition: {samples_per_partition}")
+
     async_strategy = AsynchronousStrategy(
         total_samples=total_samples,
         staleness_alpha=async_cfg["staleness_alpha"],
@@ -339,14 +348,15 @@ def run_async_simulation(
         client = clients[client_idx]
         with param_lock:
             params = current_params
+            current_update = update_count
 
-             partition_idx = round_counter % 10
-             #Calculate partition to use based on round number
+        # Calculate partition to use based on update number
+        partition_idx = current_update % 10
         
         config = {
             "start_timestamp": time(),
-          "partition_idx": partition_idx
-          }
+            "partition_idx": partition_idx
+        }
         fit_ins = FitIns(parameters=params, config=config)
         fit_res = client.fit(fit_ins)
         
