@@ -38,7 +38,7 @@ cl:
 # Async FL configuration
 async:
   enabled: true
-  total_train_time: 120  # Total training time in seconds
+  total_train_time: 120  # Total training time in seconds (increase it to 1800 for multiple rounds)
   waiting_interval: 10   # Evaluation interval in seconds
   max_workers: 4         # Concurrent client workers
   aggregation_strategy: fedasync  # fedasync, asyncfeded, or unweighted

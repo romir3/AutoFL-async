@@ -213,6 +213,7 @@ def get_data_loaders(
     batch_size = cfg.client.batch_size
    
     train_loaders = []
+    test_loaders = [] #now specific to each client
     
     # NEW: Create 10 partitions per client instead of 1
     for client_idx, client_dataset in enumerate(client_datasets):
@@ -228,11 +229,16 @@ def get_data_loaders(
         ]
         train_loaders.append(client_partition_loaders)  # 2D structure
     
-    # Test loaders remain unchanged
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
-    test_loaders = [test_loader] * num_clients
     
-    return train_loaders, test_loaders, test_loader
+    
+    #client test loaders use dataset assigned to each client for evaluation
+        client_test_loader = DataLoader(client_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+        test_loaders.append(client_test_loader)
+
+    # global loaders remain unchanged
+    global_test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    
+    return train_loaders, test_loaders, global_test_loader
 
 
 def run_async_simulation(
@@ -330,16 +336,25 @@ def run_async_simulation(
     
     # Log initial metrics to WandB
     if wandb_enabled:
+        # a custom step metric to handle async
+        for i in range(num_clients):
+
+            wandb.define_metric(f"client_{i}_round")
+            wandb.define_metric(f"client_{i}/*", step_metric=f"client_{i}_round")
+
         wandb.log({
             "async/loss": initial_loss,
             "async/accuracy": initial_acc,
             "async/updates": 0,
             "async/elapsed_time": 0.0,
-        }, step=0)
+        })#, step=0)
     
     start_time = time()
     end_time = start_time + total_train_time
     update_count = 0
+
+     #Keep track of how many rounds each specific client has finished
+    client_local_rounds = {i: 0 for i in range(num_clients)}
     
     def train_client(client_idx: int) -> tuple:
         """Train a single client and return results."""
@@ -348,7 +363,7 @@ def run_async_simulation(
         client = clients[client_idx]
         with param_lock:
             params = current_params
-            current_update = update_count
+            current_update = update_count#round counter
 
         # Calculate partition to use based on update number
         partition_idx = current_update % 10
@@ -360,6 +375,17 @@ def run_async_simulation(
         fit_ins = FitIns(parameters=params, config=config)
         fit_res = client.fit(fit_ins)
         
+# evaluate local model right after training
+        from flwr.common import parameters_to_ndarrays
+        local_params = parameters_to_ndarrays(fit_res.parameters)
+
+        #reuse evaluate_global_model but pass it local_params instead     
+        _, local_acc = evaluate_global_model(
+            global_model, local_params, test_loaders[client_idx], device
+        )
+        
+        fit_res.metrics["local_test_acc"] = local_acc
+
         return client_idx, fit_res
     
     def aggregate_result(client_idx: int, fit_res):
@@ -377,18 +403,38 @@ def run_async_simulation(
             )
             current_params = new_params
             update_count += 1
+            current_update_for_log=update_count
         
         elapsed = time() - start_time
+
+# get the local accuracy generated during train_client
+        local_acc = fit_res.metrics.get("local_test_acc", 0.0)
+
+
         history.add_metrics_distributed_fit_async(
             client_id=str(client_idx),
             metrics={
                 "loss": fit_res.metrics.get("loss", 0),
                 "staleness": t_diff,
                 "samples": fit_res.num_examples,
+                "local_test_acc": local_acc, # Add to history
             },
             timestamp=elapsed,
         )
-        
+
+         # log client-specific metrics to WandB to create independent graphs
+        if wandb_enabled:
+            partition_trained = fit_res.metrics.get("partition_idx", 0)
+            wandb.log({
+                f"client_{client_idx}/local_accuracy": local_acc,
+                f"client_{client_idx}/partition_trained": partition_trained,
+                f"client_{client_idx}/update_round": current_update_for_log,
+                f"client_{client_idx}_round": client_local_rounds[client_idx]
+            })
+
+            # Increment the round for this client for next time
+            client_local_rounds[client_idx] += 1
+
         return t_diff
     
     # Run async training
@@ -455,7 +501,7 @@ def run_async_simulation(
                     "async/accuracy": acc,
                     "async/updates": update_count,
                     "async/elapsed_time": elapsed,
-                }, step=eval_counter)
+                })#, step=eval_counter)
             
             last_eval_time = time()
         
