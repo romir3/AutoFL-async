@@ -162,8 +162,28 @@ def get_model(cfg: DictConfig) -> torch.nn.Module:
 
 def get_data_loaders(
     cfg: DictConfig, num_clients: int
-) -> tuple[List[DataLoader], List[DataLoader], DataLoader]:
+) -> tuple[
+    List[DataLoader] | List[List[DataLoader]], 
+    List[DataLoader] | List[List[DataLoader]], 
+    DataLoader | List[DataLoader]
+]:
     """Create train/test data loaders for each client."""
+
+    if cfg.dataset.workload == "split_cifar10":
+        from workloads.SplitCIFAR10_Time import get_split_cifar10_phases_loaders
+        # This will return: (5 train_loaders, 5 client_test_loaders, 5 global_test_loaders)
+        return get_split_cifar10_phases_loaders(
+            num_clients=num_clients, 
+            batch_size=cfg.client.batch_size
+        )
+    elif cfg.dataset.workload == "split_cifar100":
+        from workloads.SplitCIFAR100_Time import get_split_cifar100_phases_loaders
+        return get_split_cifar100_phases_loaders(
+            num_clients=num_clients, 
+            batch_size=cfg.client.batch_size
+        )
+
+
     from torchvision import datasets, transforms
     
     # Get transforms based on dataset
@@ -229,9 +249,9 @@ def run_async_simulation(
     cfg: DictConfig,
     async_cfg: Dict[str, Any],
     model_fn: callable,
-    train_loaders: List[DataLoader],
-    test_loaders: List[DataLoader],
-    global_test_loader: DataLoader,
+    train_loaders: List[DataLoader] | List[List[DataLoader]],
+    test_loaders: List[DataLoader] | List[List[DataLoader]],
+    global_test_loader: DataLoader | List[DataLoader],
     device: torch.device,
 ) -> Dict[str, Any]:
     """Run async FL simulation with simulated clients.
@@ -249,13 +269,16 @@ def run_async_simulation(
     
     num_clients = len(train_loaders)
     
+
+    init_train_loaders = [tl[0] if isinstance(tl, list) else tl for tl in train_loaders]
+    init_test_loaders = [tl[0] if isinstance(tl, list) else tl for tl in test_loaders]
     # Create simulated clients
     print(f"\nCreating {num_clients} simulated clients...")
     clients = create_simulated_clients(
         num_clients=num_clients,
         model_fn=model_fn,
-        train_loaders=train_loaders,
-        test_loaders=test_loaders,
+        train_loaders=init_train_loaders,
+        test_loaders=init_test_loaders,
         device=device,
         local_epochs=cfg.client.local_epochs,
         learning_rate=cfg.client.learning_rate,
@@ -269,7 +292,11 @@ def run_async_simulation(
     global_params = [val.cpu().numpy() for _, val in global_model.state_dict().items()]
     
     # Create async strategy
-    total_samples = sum(len(loader.dataset) for loader in train_loaders)
+    #total_samples = sum(len(loader.dataset) for loader in train_loaders)
+    total_samples = sum(
+        sum(len(l.dataset) for l in loader) if isinstance(loader, list) else len(loader.dataset)
+        for loader in train_loaders
+    )
     async_strategy = AsynchronousStrategy(
         total_samples=total_samples,
         staleness_alpha=async_cfg["staleness_alpha"],
@@ -302,7 +329,7 @@ def run_async_simulation(
     print("=" * 60 + "\n")
     
     # Evaluate initial model
-    initial_loss, initial_acc = evaluate_global_model(
+    initial_loss, initial_acc, initial_phases = evaluate_global_model(
         global_model, global_params, global_test_loader, device
     )
     print(f"[t=0.0s] Initial - Loss: {initial_loss:.4f}, Accuracy: {initial_acc:.4f}")
@@ -311,22 +338,41 @@ def run_async_simulation(
     
     # Log initial metrics to WandB
     if wandb_enabled:
-        wandb.log({
+        init_log = {
             "async/loss": initial_loss,
             "async/accuracy": initial_acc,
             "async/updates": 0,
             "async/elapsed_time": 0.0,
-        }, step=0)
+        }#, step=0)
+
+        for k, v in initial_phases.items():
+            init_log[f"async/{k}"] = v
+            
+        wandb.log(init_log, step=0) 
     
     start_time = time()
     end_time = start_time + total_train_time
     update_count = 0
+     
+    #code block specific to split cifar10 / cifar100
+    is_split_cifar = (cfg.dataset.workload in ["split_cifar10", "split_cifar100"])
+    if is_split_cifar:
+        num_phases = 5
+        phase_duration = total_train_time / num_phases
     
-    def train_client(client_idx: int) -> tuple:
+    def train_client(client_idx: int,elapsed: float) -> tuple:
         """Train a single client and return results."""
         from flwr.common import FitIns
         
         client = clients[client_idx]
+
+        if is_split_cifar:
+            phase_idx = int(elapsed / phase_duration)
+            phase_idx = min(phase_idx, num_phases - 1)
+            # Give client the globally shared phase dataloader
+            client.train_loader = train_loaders[client_idx][phase_idx]
+            client._num_examples = len(client.train_loader.dataset)
+
         with param_lock:
             params = current_params
         
@@ -376,7 +422,8 @@ def run_async_simulation(
     for _ in range(min(max_workers, num_clients)):
         if client_queue:
             client_idx = client_queue.pop(0)
-            future = executor.submit(train_client, client_idx)
+            elapsed = time() - start_time # specific to split cifar10
+            future = executor.submit(train_client, client_idx, elapsed)
             active_futures.add((future, client_idx))
     
     while time() < end_time and (active_futures or client_queue):
@@ -401,7 +448,8 @@ def run_async_simulation(
             if time() < end_time:
                 # Cycle through clients
                 next_client = client_idx  # Re-use same client
-                future = executor.submit(train_client, next_client)
+                elapsed = time()- start_time
+                future = executor.submit(train_client, next_client, elapsed)
                 active_futures.add((future, next_client))
         
         # Periodic evaluation
@@ -410,7 +458,7 @@ def run_async_simulation(
             with param_lock:
                 eval_params = parameters_to_ndarrays(current_params)
             
-            loss, acc = evaluate_global_model(
+            loss, acc, phase_metrics = evaluate_global_model(
                 global_model, eval_params, global_test_loader, device
             )
             elapsed = time() - start_time
@@ -424,12 +472,18 @@ def run_async_simulation(
             
             # Log to WandB
             if wandb_enabled:
-                wandb.log({
+                eval_log ={
                     "async/loss": loss,
                     "async/accuracy": acc,
                     "async/updates": update_count,
                     "async/elapsed_time": elapsed,
-                }, step=eval_counter)
+                }#, step=eval_counter)
+# # add our phase 0 through 4 accuracies 
+                for k, v in phase_metrics.items():
+                    eval_log[f"async/{k}"] = v
+                    
+                # step=eval_counter creates the 'Rounds of Global Evaluation' X-axis!
+                wandb.log(eval_log, step=eval_counter) 
             
             last_eval_time = time()
         
@@ -441,7 +495,7 @@ def run_async_simulation(
     with param_lock:
         final_params = parameters_to_ndarrays(current_params)
     
-    final_loss, final_acc = evaluate_global_model(
+    final_loss, final_acc, final_phase_metrics = evaluate_global_model(
         global_model, final_params, global_test_loader, device
     )
     elapsed = time() - start_time
@@ -488,9 +542,10 @@ def run_async_simulation(
 def evaluate_global_model(
     model: torch.nn.Module,
     params: List[np.ndarray],
-    test_loader: DataLoader,
+    test_loader: DataLoader | List[DataLoader],
     device: torch.device,
-) -> tuple[float, float]:
+) -> tuple[float, float, dict]:
+# dict to use as a dictionary for phase wise metrics that can be used for logging
     """Evaluate model with given parameters."""
     # Load parameters
     state_dict = model.state_dict()
@@ -501,13 +556,23 @@ def evaluate_global_model(
     # Evaluate
     model.eval()
     criterion = torch.nn.CrossEntropyLoss()
+
+    loaders = test_loader if isinstance(test_loader, list) else [test_loader]
+    is_multi_phase = isinstance(test_loader, list)
     
     total_loss = 0.0
     correct = 0
     total = 0
+    phase_metrics= {}
     
     with torch.no_grad():
-        for batch in test_loader:
+      for phase_idx, loader in enumerate(loaders):
+        phase_loss = 0.0
+        phase_correct = 0
+        phase_total = 0
+            
+
+        for batch in loader:
             if isinstance(batch, dict):
                 images = batch.get("img", batch.get("x")).to(device)
                 labels = batch.get("label", batch.get("y")).to(device)
@@ -518,16 +583,31 @@ def evaluate_global_model(
             
             outputs = model(images)
             loss = criterion(outputs, labels)
-            total_loss += loss.item() * labels.size(0)
+            phase_loss += loss.item() * labels.size(0)
             
             _, predicted = outputs.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
+            phase_total += labels.size(0)
+            phase_correct += predicted.eq(labels).sum().item()
+
+        if is_multi_phase and phase_total > 0:
+            p_loss = phase_loss / phase_total
+            p_acc = phase_correct / phase_total
+
+            phase_metrics[f"phase_{phase_idx}_accuracy"] = p_acc
+
+            if getattr(cfg.dataset, "workload", "") == "split_cifar100":
+                print(f"    -> Phase {phase_idx} (Classes {phase_idx*20}-{phase_idx*20+19}) | Loss: {p_loss:.4f}, Acc: {p_acc:.4f}")
+            else:
+                print(f"    -> Phase {phase_idx} (Classes {phase_idx*2}-{phase_idx*2+1}) | Loss: {p_loss:.4f}, Acc: {p_acc:.4f}")
+            
+        total_loss += phase_loss
+        correct += phase_correct
+        total += phase_total
     
     avg_loss = total_loss / max(total, 1)
     accuracy = correct / max(total, 1)
     
-    return avg_loss, accuracy
+    return avg_loss, accuracy, phase_metrics
 
 
 def main() -> None:

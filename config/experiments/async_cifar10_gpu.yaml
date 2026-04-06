@@ -10,7 +10,7 @@ model:
 
 # Dataset configuration  
 dataset:
-  workload: cifar10
+  workload: split_cifar10
 
 # Server configuration
 server:
@@ -33,12 +33,12 @@ client:
 # CL configuration
 cl:
   strategy: naive
-  num_experiences: 3
+  num_experiences: 1 #3
 
 # Async FL configuration
 async:
   enabled: true
-  total_train_time: 120  # Total training time in seconds
+  total_train_time: 120 #1200 to get results   Total training time in seconds
   waiting_interval: 10   # Evaluation interval in seconds
   max_workers: 4         # Concurrent client workers
   aggregation_strategy: fedasync  # fedasync, asyncfeded, or unweighted
